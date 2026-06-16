@@ -37,7 +37,11 @@ from unsloth import FastLanguageModel          # noqa: E402
 from safe_generate import safe_generate        # noqa: E402
 
 model, tokenizer = FastLanguageModel.from_pretrained(MODEL_PATH, load_in_4bit=True)
-print("[model_server] model loaded — ready to generate.")
+print("=" * 70)
+print("[model_server] ✅ MODEL LOADED — server is ACTIVE and waiting for queries.")
+print("[model_server]    POST your question to  http://localhost:9000/generate")
+print("[model_server]    (it generates per-request; keep this process running)")
+print("=" * 70)
 
 app = FastAPI(title="MegaStore Pulse — FT Model Server")
 
@@ -54,6 +58,16 @@ def health():
 
 @app.post("/generate")
 def generate(req: GenRequest):
+    print(f"\n[model_server] ► query received: {req.query!r}")
+    print("[model_server]   calling the model…")
     prompt = f"### Instruction:\n{req.query}\n\n### Response:\n"
     yaml_output = safe_generate(model, tokenizer, prompt, max_new_tokens=req.max_new_tokens)
+    print(f"[model_server] ◄ generated {len(yaml_output)} chars of YAML for this query.")
     return {"yaml": yaml_output}
+
+
+if __name__ == "__main__":
+    # Run with the SAME interpreter that runs model.py (so it uses the ROCm torch):
+    #     python model_server.py
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "9000")))
