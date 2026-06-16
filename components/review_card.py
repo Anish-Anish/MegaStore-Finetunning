@@ -39,7 +39,7 @@ def render_review_card(item: dict, yaml_data: dict):
             value=yaml_data.get("yaml_full", ""),
             language="yaml", theme="tomorrow_night_bright", keybinding="vscode",
             font_size=13, tab_size=2, wrap=True, show_gutter=True,
-            readonly=not editing, auto_update=True, min_lines=12, max_lines=26, key=f"ace_{cid}",
+            readonly=not editing, auto_update=True, min_lines=10, max_lines=10, key=f"ace_{cid}",
         )
 
         # ── Validation (animated badges) ──────────────────────────────────────
