@@ -162,9 +162,23 @@ def load_real_model():
 
 
 def _generate_real_yaml(question: str):
-    """Get YAML from the fine-tuned model. Tries the HTTP model server first
-    (recommended — loads once, no threading issues), then in-process import."""
-    # 1) HTTP model server (run model_server.py on the workspace)
+    """Get YAML from the fine-tuned model.
+
+    PRIMARY: in-process — this is exactly your model.py code with the user's query
+    swapped in (works when the backend runs in the env where model.py works).
+    FALLBACK: a separate HTTP model server, if you chose to run one.
+    """
+    # 1) In-process — your model.py flow, query = the user's question
+    if os.path.isdir(MODEL_DIR) and load_real_model():
+        try:
+            prompt = f"### Instruction:\n{question}\n\n### Response:\n"
+            yaml_output = real_safe_generate(real_model, real_tokenizer, prompt, max_new_tokens=300)
+            print(f"[FT model] generated in-process for: {question[:60]!r}")
+            return yaml_output
+        except Exception as e:
+            print(f"[FT model] in-process generation error: {e}")
+
+    # 2) HTTP model server fallback (optional)
     try:
         r = requests.post(f"{MODEL_SERVER_URL}/generate",
                           json={"query": question, "max_new_tokens": 300}, timeout=GEN_TIMEOUT)
@@ -173,20 +187,9 @@ def _generate_real_yaml(question: str):
             if y:
                 print(f"[FT model] generated via model server for: {question[:60]!r}")
                 return y
-    except Exception as e:
-        print(f"[FT model] model server unavailable ({e}); trying in-process import…")
-
-    # 2) In-process import (only works on the workspace with unsloth + GPU)
-    if not load_real_model():
-        return None
-    try:
-        prompt = f"### Instruction:\n{question}\n\n### Response:\n"
-        yaml_output = real_safe_generate(real_model, real_tokenizer, prompt, max_new_tokens=300)
-        print(f"[FT model] generated in-process for: {question[:60]!r}")
-        return yaml_output
-    except Exception as e:
-        print(f"[FT model] in-process generation error: {e}")
-        return None
+    except Exception:
+        pass
+    return None
 
 
 def _format_yaml_html(yaml_text: str) -> str:
