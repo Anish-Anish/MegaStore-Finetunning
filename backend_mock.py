@@ -105,12 +105,50 @@ sink:
   channel: "#ops-alerts"
   webhook: "${env.SLACK_WEBHOOK_OPS}" """
 
+YAML_INVENTORY = """<span class="yd-cm"># pipeline: low_inventory_alert  (FT model · Qwen2.5-14B · 3.1s)</span>
+<span class="yd-add">+ source: { type: <span class="yd-str">postgres_cdc</span>, tables: [inventory], topic: <span class="yd-str">retail_events</span> }</span>
+<span class="yd-add">+ transforms:</span>
+<span class="yd-add">+   - filter: <span class="yd-str">"quantity_on_hand < 5"</span></span>
+<span class="yd-add">+   - join: <span class="yd-str">warehouses ON inventory.warehouse_id = warehouses.warehouse_id</span></span>
+<span class="yd-add">+   - join: <span class="yd-str">products ON inventory.product_id = products.product_id</span></span>
+<span class="yd-add">+ sink: { type: <span class="yd-str">slack</span>, channel: <span class="yd-str">"#inventory-alerts"</span>, webhook: <span class="yd-str">"${env.SLACK_WEBHOOK_INVENTORY}"</span> }</span>"""
+
+YAML_FULL_INVENTORY = """pipeline:
+  name: low_inventory_alert
+  description: Alerts when inventory < 5 units in any warehouse
+  version: "1.0"
+source:
+  type: postgres_cdc
+  connection: megastore_primary
+  tables:
+    - table: inventory
+      primary_key: inventory_id
+      capture_mode: cdc_only
+  kafka_topic: megastore.retail_events
+transforms:
+  - id: filter_low_inventory
+    type: filter
+    source: inventory
+    conditions:
+      - field: quantity_on_hand
+        operator: LESS_THAN
+        value: 5
+sink:
+  - id: slack_low_inventory
+    type: slack
+    source: filter_low_inventory
+    channel: "#inventory-alerts"
+    webhook_url: "${env.SLACK_WEBHOOK_INVENTORY}\""""
+
 YAML_BY_KIND = {
     "sales_by_category": (YAML_CATEGORY, YAML_FULL_CATEGORY,
                           ["All 5 tables exist in schema", "Join keys validated", "No circular joins",
                            "Window syntax correct", "Sink table writable"]),
     "high_returns": (YAML_RETURNS, YAML_FULL_RETURNS,
                      ["All 3 tables exist", "Join keys valid", "Slack env var set", "Filter threshold sensible"]),
+    "low_inventory": (YAML_INVENTORY, YAML_FULL_INVENTORY,
+                      ["Table 'inventory' exists", "Field quantity_on_hand valid", "Slack webhook env set",
+                       "Threshold (< 5) sensible", "CDC capture mode valid"]),
 }
 
 
@@ -342,24 +380,60 @@ def answer_top_returns():
     }
 
 
+def answer_low_inventory():
+    return {
+        "title": "Low Inventory Alert — by Warehouse",
+        "subtitle": "Live · threshold: 5 units on hand · alerts sent to #inventory-alerts",
+        "badges": [{"cls": "badge-red", "html": "⚠ 3 SKUs below threshold"}] + _badges_live(),
+        "kpis": [
+            {"val": "3", "label": "SKUs below 5 units", "delta": "↑ +2 vs last check", "delta_cls": "down"},
+            {"val": "2", "label": "Warehouses affected", "delta": "South · West", "delta_cls": "flat"},
+            {"val": "1", "label": "Critically low (≤1)", "delta": "needs restock now", "delta_cls": "down"},
+            {"val": "₹0.9L", "label": "Suggested reorder value", "delta": "auto-PO ready", "delta_cls": "flat"},
+        ],
+        "table": {
+            "columns": ["#", "Product", "Warehouse", "On hand", "Reorder point", "Status"],
+            "rows": [
+                ['<span class="rank">1</span>', "Samsung Galaxy M34 (Blue)", "Chennai WH-042", '<span style="color:var(--red);font-weight:600">1</span>', "20", '<span class="badge badge-red">🚨 Critical</span>'],
+                ['<span class="rank">2</span>', "Philips Air Fryer 2.5L", "Mumbai WH-007", '<span style="color:var(--red);font-weight:600">3</span>', "15", '<span class="badge badge-red">🚨 Critical</span>'],
+                ['<span class="rank">3</span>', "Dell Wireless Mouse M215", "Chennai WH-042", '<span style="color:var(--amber);font-weight:600">4</span>', "25", '<span class="badge badge-amber">Low</span>'],
+                ['<span class="rank">4</span>', "Nike Air Max 270 (Size 9)", "Delhi WH-115", "8", "20", '<span style="color:var(--green);font-size:11px">Normal</span>'],
+            ],
+        },
+        "insight": {"icon": "🔴", "tone": "red",
+                    "html": "<strong>Restock alert:</strong> Samsung Galaxy M34 (Blue) at Chennai WH-042 is down to "
+                            "1 unit (threshold 5). A Slack alert was sent to #inventory-alerts and an auto-reorder PO "
+                            "is suggested."},
+    }
+
+
 ANSWER_BUILDERS = {
     "sales_by_category": answer_sales_by_category,
     "high_returns": answer_high_returns_live,
     "platinum": answer_platinum,
     "top_returns": answer_top_returns,
+    "low_inventory": answer_low_inventory,
 }
 
 
+def _kind_for_question(question: str) -> str:
+    """Map a business question to the right answer/YAML kind (drives the hardcoded fallback)."""
+    q = (question or "").lower()
+    if "inventory" in q or "stock" in q or "warehouse" in q:
+        return "low_inventory"
+    if "platinum" in q or "spend" in q:
+        return "platinum"
+    if "quality" in q or "defect" in q or "return rate" in q or "top product" in q:
+        return "top_returns"
+    if "return" in q:
+        return "high_returns"
+    return "sales_by_category"
+
+
 def build_answer(kind: str, seed: int, question: str = ""):
-    q = question.lower()
-    if "return" in q or "alert" in q:
-        builder = answer_high_returns_live
-    elif "platinum" in q or "spend" in q:
-        builder = answer_platinum
-    elif "product" in q or "quality" in q:
-        builder = answer_top_returns
-    else:
-        builder = ANSWER_BUILDERS.get(kind, answer_sales_by_category)
+    # Prefer the question (most specific); fall back to the stored kind.
+    builder = ANSWER_BUILDERS.get(_kind_for_question(question) if question else kind,
+                                  ANSWER_BUILDERS.get(kind, answer_sales_by_category))
     return builder()
 
 
@@ -474,7 +548,8 @@ def login(body: dict):
 async def ask(body: dict, authorization: Optional[str] = Header(None)):
     _counter[0] += 1
     cid = f"conv_{_counter[0]:04d}"
-    conversations[cid] = new_conv(cid, body["question"], "sales_by_category", "generating",
+    kind = _kind_for_question(body["question"])   # route inventory/returns/etc. to the right answer + YAML
+    conversations[cid] = new_conv(cid, body["question"], kind, "generating",
                                   "Priya", "CEO", 0, 0.95)
     _save()
     asyncio.create_task(_call_ft_model(cid))
@@ -519,6 +594,7 @@ async def _call_ft_model(cid):
         c["self_correction_attempts"] = 0
         c["model_name"] = "Qwen2.5-14B (MegaStore-LoRA)"
         print(f"[FT model] ✓ used REAL model output for {cid}")
+        print(f"-----> the op is: {yaml_output}")
     else:
         # No real model reachable → short canned fallback (NOT a 2-minute wait).
         await asyncio.sleep(2.0)
