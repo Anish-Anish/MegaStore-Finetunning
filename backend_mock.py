@@ -15,6 +15,7 @@ import json
 import os
 import random
 import time
+import requests
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -117,12 +118,26 @@ def yaml_for(kind):
     return YAML_BY_KIND.get(kind, YAML_BY_KIND["sales_by_category"])
 
 
-# Point this at the folder containing model.py + Notebooks/ (override with MEGASTORE_MODEL_DIR).
+# ── Real fine-tuned model wiring ─────────────────────────────────────────────
+# Preferred: run model_server.py on the GPU workspace and point MODEL_SERVER_URL here.
+# Fallback: in-process import (only works when this backend runs on the workspace).
+MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://localhost:9000")
 MODEL_DIR = os.getenv("MEGASTORE_MODEL_DIR", "/workspace/shared/code space/Megastorepipeline")
-MODEL_ENABLED = os.path.isdir(MODEL_DIR)   # real FT model only runs where the folder exists (the GPU workspace)
+GEN_TIMEOUT = float(os.getenv("MODEL_GEN_TIMEOUT", "300"))
 real_model = None
 real_tokenizer = None
 real_safe_generate = None
+
+
+def _model_server_ok():
+    try:
+        return requests.get(f"{MODEL_SERVER_URL}/health", timeout=2).ok
+    except Exception:
+        return False
+
+
+# True if EITHER the HTTP model server is reachable OR the model folder exists locally.
+MODEL_ENABLED = _model_server_ok() or os.path.isdir(MODEL_DIR)
 
 def load_real_model():
     global real_model, real_tokenizer, real_safe_generate
@@ -147,14 +162,30 @@ def load_real_model():
 
 
 def _generate_real_yaml(question: str):
+    """Get YAML from the fine-tuned model. Tries the HTTP model server first
+    (recommended — loads once, no threading issues), then in-process import."""
+    # 1) HTTP model server (run model_server.py on the workspace)
+    try:
+        r = requests.post(f"{MODEL_SERVER_URL}/generate",
+                          json={"query": question, "max_new_tokens": 300}, timeout=GEN_TIMEOUT)
+        if r.ok:
+            y = r.json().get("yaml")
+            if y:
+                print(f"[FT model] generated via model server for: {question[:60]!r}")
+                return y
+    except Exception as e:
+        print(f"[FT model] model server unavailable ({e}); trying in-process import…")
+
+    # 2) In-process import (only works on the workspace with unsloth + GPU)
     if not load_real_model():
         return None
     try:
         prompt = f"### Instruction:\n{question}\n\n### Response:\n"
         yaml_output = real_safe_generate(real_model, real_tokenizer, prompt, max_new_tokens=300)
+        print(f"[FT model] generated in-process for: {question[:60]!r}")
         return yaml_output
     except Exception as e:
-        print(f"Error running model: {e}")
+        print(f"[FT model] in-process generation error: {e}")
         return None
 
 
@@ -183,12 +214,15 @@ def _extract_pipeline_name(yaml_text: str) -> str:
 
 @app.on_event("startup")
 async def _startup_preload():
-    if MODEL_ENABLED:
-        print(f"[FT model] ENABLED — preloading from: {MODEL_DIR}")
+    if _model_server_ok():
+        print(f"[FT model] ENABLED via model server at {MODEL_SERVER_URL}")
+    elif os.path.isdir(MODEL_DIR):
+        print(f"[FT model] ENABLED via in-process import — preloading from: {MODEL_DIR}")
         asyncio.create_task(asyncio.to_thread(load_real_model))
     else:
-        print(f"[FT model] DISABLED — using mock YAML. Set MEGASTORE_MODEL_DIR to a folder "
-              f"with model.py + Notebooks/ (and run on the GPU workspace) to use the real model.")
+        print(f"[FT model] NOT FOUND — will use mock YAML.\n"
+              f"           → To use the real model: run model_server.py on the GPU workspace, "
+              f"then set MODEL_SERVER_URL (current: {MODEL_SERVER_URL}).")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -460,19 +494,19 @@ async def _call_ft_model(cid):
     c["status"] = "validating"
     _save()
 
+    # Always attempt the real model — _generate_real_yaml returns None fast if neither the
+    # model server nor the in-process model is available, so local dev stays snappy.
     yaml_output = None
-    if MODEL_ENABLED:
-        try:
-            import time as _t
-            t0 = _t.time()
-            yaml_output = await asyncio.wait_for(
-                asyncio.to_thread(_generate_real_yaml, c["question"]),
-                timeout=300.0,   # first call may include model load; inference itself is quick
-            )
-            c["generation_time_ms"] = int((_t.time() - t0) * 1000)
-        except Exception as e:
-            print(f"[FT model] generation error/timeout: {e}")
-            yaml_output = None
+    try:
+        t0 = time.time()
+        yaml_output = await asyncio.wait_for(
+            asyncio.to_thread(_generate_real_yaml, c["question"]),
+            timeout=GEN_TIMEOUT,   # first call may include model load; inference itself is quick
+        )
+        c["generation_time_ms"] = int((time.time() - t0) * 1000)
+    except Exception as e:
+        print(f"[FT model] generation error/timeout: {e}")
+        yaml_output = None
 
     if yaml_output:
         # Real model output → flows to the data engineer for review exactly like the mock did.
@@ -481,11 +515,12 @@ async def _call_ft_model(cid):
         c["pipeline_name_real"] = _extract_pipeline_name(yaml_output)
         c["self_correction_attempts"] = 0
         c["model_name"] = "Qwen2.5-14B (MegaStore-LoRA)"
+        print(f"[FT model] ✓ used REAL model output for {cid}")
     else:
-        # No real model here → short canned fallback (NOT a 2-minute wait).
-        if not MODEL_ENABLED:
-            await asyncio.sleep(2.5)
+        # No real model reachable → short canned fallback (NOT a 2-minute wait).
+        await asyncio.sleep(2.0)
         c["self_correction_attempts"] = 1
+        print(f"[FT model] ✗ no model reachable — used mock YAML for {cid}")
 
     c["status"] = "pending_review"
     _save()
