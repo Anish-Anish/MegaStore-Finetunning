@@ -117,7 +117,9 @@ def yaml_for(kind):
     return YAML_BY_KIND.get(kind, YAML_BY_KIND["sales_by_category"])
 
 
-MODEL_DIR = "/workspace/shared/code space/Megastorepipeline"
+# Point this at the folder containing model.py + Notebooks/ (override with MEGASTORE_MODEL_DIR).
+MODEL_DIR = os.getenv("MEGASTORE_MODEL_DIR", "/workspace/shared/code space/Megastorepipeline")
+MODEL_ENABLED = os.path.isdir(MODEL_DIR)   # real FT model only runs where the folder exists (the GPU workspace)
 real_model = None
 real_tokenizer = None
 real_safe_generate = None
@@ -165,6 +167,28 @@ def _format_yaml_html(yaml_text: str) -> str:
         else:
             lines.append(f'<span class="yd-add">{escaped}</span>')
     return "\n".join(lines)
+
+
+def _extract_pipeline_name(yaml_text: str) -> str:
+    """Pull the pipeline name out of the generated YAML (the line under 'pipeline:')."""
+    try:
+        for line in yaml_text.splitlines():
+            s = line.strip()
+            if s.startswith("name:"):
+                return s.split("name:", 1)[1].strip().strip('"\'') + " — FT-generated pipeline"
+    except Exception:
+        pass
+    return "ai_generated_pipeline — FT model"
+
+
+@app.on_event("startup")
+async def _startup_preload():
+    if MODEL_ENABLED:
+        print(f"[FT model] ENABLED — preloading from: {MODEL_DIR}")
+        asyncio.create_task(asyncio.to_thread(load_real_model))
+    else:
+        print(f"[FT model] DISABLED — using mock YAML. Set MEGASTORE_MODEL_DIR to a folder "
+              f"with model.py + Notebooks/ (and run on the GPU workspace) to use the real model.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -422,48 +446,49 @@ async def ask(body: dict, authorization: Optional[str] = Header(None)):
 
 
 async def _call_ft_model(cid):
-    """Simulate the fine-tuned Mistral-7B+LoRA model generating the pipeline YAML + answer."""
+    """AI builds pipeline: hit the fine-tuned model with the user's question and get real YAML.
+
+    Falls back to canned YAML only if the model folder/GPU isn't available (e.g. local dev),
+    so the demo still works without the workspace.
+    """
     c = conversations.get(cid)
     if not c:
         return
 
-    yaml_output = None
-    error_occurred = False
+    # brief "validating" flash so the journey feels alive while the model runs
+    await asyncio.sleep(0.5)
+    c["status"] = "validating"
+    _save()
 
-    if os.path.exists(MODEL_DIR):
+    yaml_output = None
+    if MODEL_ENABLED:
         try:
-            # Wrap the generation call in asyncio.wait_for with a 120.0-second timeout
+            import time as _t
+            t0 = _t.time()
             yaml_output = await asyncio.wait_for(
                 asyncio.to_thread(_generate_real_yaml, c["question"]),
-                timeout=120.0
+                timeout=300.0,   # first call may include model load; inference itself is quick
             )
-            if yaml_output is None:
-                error_occurred = True
-        except (asyncio.TimeoutError, Exception) as e:
-            print(f"Error during model generation or timeout: {e}")
-            error_occurred = True
+            c["generation_time_ms"] = int((_t.time() - t0) * 1000)
+        except Exception as e:
+            print(f"[FT model] generation error/timeout: {e}")
+            yaml_output = None
 
-    if yaml_output and not error_occurred:
+    if yaml_output:
+        # Real model output → flows to the data engineer for review exactly like the mock did.
         c["yaml_full"] = yaml_output
         c["yaml_html"] = _format_yaml_html(yaml_output)
-        c["status"] = "pending_review"
+        c["pipeline_name_real"] = _extract_pipeline_name(yaml_output)
         c["self_correction_attempts"] = 0
-        _save()
-    elif error_occurred:
-        # If something happened or some error occurred, immediately show the hardcoded YAML content
-        c["status"] = "pending_review"
-        c["self_correction_attempts"] = 1
-        _save()
+        c["model_name"] = "Qwen2.5-14B (MegaStore-LoRA)"
     else:
-        # Normal mock flow: wait for 2 minutes, then show the dummy data to the data engineer
-        # Let's show validating state briefly first to feel realistic, then sleep for the remainder of the 2 minutes
-        await asyncio.sleep(0.8)
-        c["status"] = "validating"
-        _save()
-        await asyncio.sleep(119.2)  # Remaining time of the 120.0 seconds total wait
-        c["status"] = "pending_review"
+        # No real model here → short canned fallback (NOT a 2-minute wait).
+        if not MODEL_ENABLED:
+            await asyncio.sleep(2.5)
         c["self_correction_attempts"] = 1
-        _save()
+
+    c["status"] = "pending_review"
+    _save()
 
 
 @app.get("/pipelines/{cid}/status")
@@ -562,6 +587,9 @@ def review_queue(status: str = "pending_review", authorization: Optional[str] = 
 
 
 def _pipeline_name(c):
+    # If the real model generated YAML, use the name parsed from it.
+    if c.get("pipeline_name_real"):
+        return c["pipeline_name_real"]
     q = c.get("question", "").lower()
     if "inventory" in q:
         return "low_inventory_alert — Flink job + Slack sink"
@@ -592,7 +620,7 @@ def review_yaml(cid: str, authorization: Optional[str] = Header(None)):
         "yaml_html": yhtml, "yaml_full": yfull, "validation": checks,
         "trust_10": round(c["confidence"] * 10, 1),
         "self_correction_attempts": c.get("self_correction_attempts", 0),
-        "model_info": {"model": "Qwen2.5-14B", "adapter": "MegaStore-LoRA-v2",
+        "model_info": {"model": c.get("model_name", "Qwen2.5-14B"), "adapter": "MegaStore-LoRA-v2",
                        "confidence": c["confidence"], "generation_time_ms": c["generation_time_ms"]},
     }
 
