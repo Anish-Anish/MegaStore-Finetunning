@@ -160,7 +160,7 @@ def yaml_for(kind):
 # Preferred: run model_server.py on the GPU workspace and point MODEL_SERVER_URL here.
 # Fallback: in-process import (only works when this backend runs on the workspace).
 MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL", "http://localhost:9000")
-MODEL_DIR = os.getenv("MEGASTORE_MODEL_DIR", "/workspace/shared/code space/Megastorepipeline")
+MODEL_DIR = os.getenv("MEGASTORE_MODEL_DIR", os.path.dirname(os.path.abspath(__file__)))
 GEN_TIMEOUT = float(os.getenv("MODEL_GEN_TIMEOUT", "300"))
 real_model = None
 real_tokenizer = None
@@ -175,23 +175,23 @@ def _model_server_ok():
 
 
 # True if EITHER the HTTP model server is reachable OR the model folder exists locally.
-MODEL_ENABLED = _model_server_ok() or os.path.isdir(MODEL_DIR)
+MODEL_ENABLED = _model_server_ok() or os.path.isdir(os.path.join(MODEL_DIR, "training", "final_model"))
 
 def load_real_model():
     global real_model, real_tokenizer, real_safe_generate
     if real_model is not None:
         return True
-    if not os.path.exists(MODEL_DIR):
+    training_path = os.path.join(MODEL_DIR, "training")
+    if not os.path.exists(training_path):
         return False
     try:
         import sys
-        notebooks_path = os.path.join(MODEL_DIR, "Notebooks")
-        if notebooks_path not in sys.path:
-            sys.path.insert(0, notebooks_path)
+        if training_path not in sys.path:
+            sys.path.insert(0, training_path)
         from unsloth import FastLanguageModel
         from safe_generate import safe_generate
         real_safe_generate = safe_generate
-        model_path = os.path.join(notebooks_path, "final_model")
+        model_path = os.path.join(training_path, "final_model")
         real_model, real_tokenizer = FastLanguageModel.from_pretrained(model_path, load_in_4bit=True)
         return True
     except Exception as e:

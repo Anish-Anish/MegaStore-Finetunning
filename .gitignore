@@ -11,3 +11,15 @@ data/conversations.json
 *.png
 *.jpg
 *.jpeg
+
+# Allow architecture diagrams/documentation assets
+!docs/images/*.jpeg
+!docs/images/*.jpg
+!docs/images/*.png
+!docs/images/*.webp
+!docs/**/*.pptx
+
+# Ignore large fine-tuned model binary weights
+*.safetensors
+*.bin
+
